@@ -230,15 +230,16 @@
                         };
                     };
 
-                    // Disable CAM1 side
-                    i2c@1 {
-                        imx296_c@1a {
-                            status = "disabled";
-                        };
-                    };
+                    /*
+                     * (Removed) A "disable CAM1 side" block used to disable
+                     * a phantom i2c@1/imx296_c@1a node that no overlay ever
+                     * creates (the -C overlay names its node imx296_a@1a
+                     * too). The base DTB carries no camera nodes at all, so
+                     * there is nothing to disable here.
+                     */
                 };
 
-                // GPIO hogs - drive all camera GPIOs to safe low state at boot
+                // GPIO hog - park the unused legacy CAM1 reset line low at boot
                 gpio@2200000 {
                     camera-control-output-low {
                         gpio-hog;
@@ -247,14 +248,15 @@
                         label = "cam1-rst";
                     };
                 };
-                gpio@6000d000 {
-                    camera-control-output-low {
-                        gpio-hog;
-                        output-low;
-                        gpios = <CAM1_PWDN 0 CAM0_PWDN 0>;
-                        label = "cam1-pwdn", "cam0-pwdn";
-                    };
-                };
+                /*
+                 * (Removed) A gpio@6000d000 hog block used to "park"
+                 * CAM0_PWDN and CAM1_PWDN low. 0x6000d000 is the Tegra210
+                 * legacy GPIO controller address - it does not exist on
+                 * Tegra234, so the hog never applied (silently inert).
+                 * Do NOT re-add it under the real gpio@2200000 either: the
+                 * driver gpio_request()s the active camera's PWDN line, and
+                 * a live hog on it would fail the probe with -EBUSY.
+                 */
             };
         };
     };
