@@ -26,11 +26,20 @@ typedef struct reg_8 imx296_reg;
 
 /*
  * Mode indices - must match mode_table[] array order below.
- * IMX296 has only one resolution (1456x1088) unlike OV9281.
- * Timing is controlled via VMAX/HMAX registers, not separate mode tables.
+ *
+ * IMPORTANT: set_mode() indexes mode_table[] directly with the DT
+ * mode<N> index (s_data->mode_prop_idx), so all real sensor modes MUST
+ * come first and in DT order; the pseudo-mode entries (start/stop/test)
+ * follow and are only ever referenced by name.
+ *
+ * mode0: 1456x1088 full array @ up to 60 fps
+ * mode1: 1280x720 centered ROI crop @ up to 90 fps
+ * Timing (VMAX/SHS1/GAIN) is set in common_regs and updated dynamically
+ * by control handlers; the per-mode tables handle windowing/ROI.
  */
 enum {
 	IMX296_MODE_1456X1088 = 0,
+	IMX296_MODE_1280X720,
 	IMX296_MODE_START_STREAM,
 	IMX296_MODE_STOP_STREAM,
 	IMX296_MODE_TEST_PATTERN,
@@ -45,12 +54,13 @@ enum {
  * The other entries may or may not be optional.
  * Do NOT modify without Sony guidance.
  *
- * Clock configuration registers (0x3089-0x308c = INCKSEL0-3) are NOT
- * included here - they depend on the input clock frequency and are
- * written separately in power_get() after the clock is configured.
- * For 37.125MHz: { 0x80, 0x0b, 0x80, 0x08 }
- * For 54MHz:     { 0xb0, 0x0f, 0xb0, 0x0c }
- * For 74.25MHz:  { 0x80, 0x0f, 0x80, 0x0c }
+ * Clock configuration registers (0x3089-0x308c = INCKSEL0-3) ARE part of
+ * this table (54 MHz set, matching the RPi GS camera's on-board
+ * oscillator), together with the clock-dependent CTRL418C. Alternative
+ * sets, should a different INCK ever be used:
+ * For 37.125MHz: { 0x80, 0x0b, 0x80, 0x08 }, CTRL418C=0x74
+ * For 54MHz:     { 0xb0, 0x0f, 0xb0, 0x0c }, CTRL418C=0xa8
+ * For 74.25MHz:  { 0x80, 0x0f, 0x80, 0x0c }, CTRL418C=0xe8
  */
 static const imx296_reg imx296_common_regs[] = {
 	/* ---- Required for CSI-2 output activation ---- */
@@ -275,6 +285,46 @@ static const imx296_reg imx296_1456x1088_regs[] = {
 };
 
 /*
+ * 1280x720 @ 90fps centered ROI mode
+ *
+ * The IMX296 reads out a cropped window via the FID0_ROI block
+ * (same mechanism the Raspberry Pi kernel driver uses for crops).
+ * Line period is unchanged (HMAX stays 1100 = 14.81us), but with only
+ * 720 active lines VMAX can drop to 750, giving:
+ *   74.25MHz / (1100 * 750) = 90.0 fps exactly.
+ *
+ * Crop is centered and 4-aligned, preserving the RGGB Bayer phase:
+ *   left = (1456-1280)/2 = 88,  top = (1088-720)/2 = 184
+ *
+ * MIPIC_AREA3W must match the cropped output height (the RPi driver
+ * writes crop->height there), overriding the 1088 from common_regs.
+ * VMAX=750 also overrides common_regs' 1118 default; set_frame_rate()
+ * recomputes it from the DT mode1 framerate range at stream start.
+ */
+static const imx296_reg imx296_1280x720_regs[] = {
+	{ 0x300d, 0x00 }, /* CTRL0D: full readout mode, no binning */
+
+	{ 0x3300, 0x03 }, /* FID0_ROI: ROIH1ON | ROIV1ON */
+	{ 0x3310, 0x58 }, /* FID0_ROIPH1[7:0]  = 88 (crop left) */
+	{ 0x3311, 0x00 }, /* FID0_ROIPH1[15:8] */
+	{ 0x3312, 0xb8 }, /* FID0_ROIPV1[7:0]  = 184 (crop top) */
+	{ 0x3313, 0x00 }, /* FID0_ROIPV1[15:8] */
+	{ 0x3314, 0x00 }, /* FID0_ROIWH1[7:0]  = 1280 (crop width) */
+	{ 0x3315, 0x05 }, /* FID0_ROIWH1[15:8] */
+	{ 0x3316, 0xd0 }, /* FID0_ROIWV1[7:0]  = 720 (crop height) */
+	{ 0x3317, 0x02 }, /* FID0_ROIWV1[15:8] */
+
+	{ 0x4182, 0xd0 }, /* MIPIC_AREA3W[7:0]  = 720 (output height) */
+	{ 0x4183, 0x02 }, /* MIPIC_AREA3W[15:8] */
+
+	{ 0x3010, 0xee }, /* VMAX[7:0]   = 750 -> 90.0 fps */
+	{ 0x3011, 0x02 }, /* VMAX[15:8]  */
+	{ 0x3012, 0x00 }, /* VMAX[22:16] */
+
+	{ IMX296_TABLE_END, 0x00 },
+};
+
+/*
  * Start stream table - intentionally minimal.
  * The actual two-step start sequence is handled directly in
  * imx296_start_streaming() because it requires a 2ms delay
@@ -360,6 +410,7 @@ static const imx296_reg imx296_test_pattern[] = {
  */
 static const imx296_reg *const mode_table[] = {
 	[IMX296_MODE_1456X1088] = imx296_1456x1088_regs,
+	[IMX296_MODE_1280X720] = imx296_1280x720_regs,
 	[IMX296_MODE_START_STREAM] = imx296_start_stream,
 	[IMX296_MODE_STOP_STREAM] = imx296_stop_stream,
 	[IMX296_MODE_TEST_PATTERN] = imx296_test_pattern,
@@ -372,11 +423,13 @@ static const imx296_reg *const mode_table[] = {
  * but 60fps is the practical maximum for this clock configuration.
  */
 static const int imx296_60fps[] = { 60 };
+static const int imx296_90fps[] = { 90 };
 
 /*
  * imx296_frmfmt - frame format table
- * Single entry - IMX296 has one native resolution.
  * Consumed by camera_common framework for V4L2 format enumeration.
+ * MUST stay in sync with the DT mode<N> nodes: entry order matches the
+ * mode enum / DT mode index (frmfmt count == number of DT modes).
  */
 static const struct camera_common_frmfmt imx296_frmfmt[] = {
 	{
@@ -385,6 +438,13 @@ static const struct camera_common_frmfmt imx296_frmfmt[] = {
 		.num_framerates = 1,
 		.hdr_en = false,
 		.mode = IMX296_MODE_1456X1088,
+	},
+	{
+		.size = { 1280, 720 },
+		.framerates = imx296_90fps,
+		.num_framerates = 1,
+		.hdr_en = false,
+		.mode = IMX296_MODE_1280X720,
 	},
 };
 
