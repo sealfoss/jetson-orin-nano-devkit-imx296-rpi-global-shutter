@@ -66,7 +66,15 @@ static const imx296_reg imx296_common_regs[] = {
 	{ 0x30a4, 0x5f }, /* undocumented */
 	{ 0x30a8, 0x91 }, /* undocumented */
 	{ 0x30ac, 0x28 }, /* undocumented */
-	{ 0x30af, 0x09 }, /* undocumented */
+	/*
+     * 0x30af: the ONLY byte on which the two reference drivers disagree.
+     * Mainline imx296.c ships 0x09; the Raspberry Pi kernel driver — the
+     * only stack known to run the RPi Global Shutter Camera cleanly — has
+     * shipped 0x0b since its driver-add commit. Prime suspect for the
+     * black horizontal line seen on every capture with 0x09; use the RPi
+     * production value.
+     */
+	{ 0x30af, 0x0b }, /* undocumented (RPi GS production value; mainline: 0x09) */
 	{ 0x30df, 0x00 }, /* undocumented */
 	{ 0x3165, 0x00 }, /* undocumented */
 	{ 0x3169, 0x10 }, /* undocumented */
@@ -149,6 +157,18 @@ static const imx296_reg imx296_common_regs[] = {
      * 0xc5 = value from mainline driver
      */
 	{ 0x4114, 0xc5 }, /* GTTABLENUM: gamma table */
+
+	/*
+     * MIPIC_AREA3W (0x4182-0x4183): MIPI output area height, 16-bit LE.
+     * The Raspberry Pi kernel driver writes this even in the un-cropped
+     * full-frame path (= IMX296_PIXEL_ARRAY_HEIGHT, 1088); mainline never
+     * touches it, leaving the power-on default. A MIPI output-area register
+     * at a stale default is the second prime suspect for the one-bad-row
+     * black-line artifact. 1088 = 0x0440. Cropped modes must override this
+     * with their own output height (RPi writes crop->height there).
+     */
+	{ 0x4182, 0x40 }, /* MIPIC_AREA3W[7:0]  = 0x40 */
+	{ 0x4183, 0x04 }, /* MIPIC_AREA3W[15:8] = 0x04 -> 1088 */
 
 	/*
      * CTRL418C: clock-dependent register
