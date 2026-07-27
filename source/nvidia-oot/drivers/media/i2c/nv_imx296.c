@@ -625,6 +625,7 @@ static int imx296_set_exposure(struct tegracam_device *tc_dev, s64 val)
 		&s_data->sensor_props.sensor_modes[s_data->mode_prop_idx];
 	imx296_reg reg_list[IMX296_SHS1_REG_COUNT];
 	int err = 0;
+	s64 exposure;
 	u32 coarse_time;
 	u32 shs1;
 	int i;
@@ -646,13 +647,21 @@ static int imx296_set_exposure(struct tegracam_device *tc_dev, s64 val)
      *   lines = (exposure_us - 14.26us) / 14.81us
      *
      * val is in Q format scaled by exposure_factor (1000000 = microseconds).
-     * Subtract the 14.26us (IMX296_EXPOSURE_OFFSET_US) offset before
-     * converting to lines. Multiply first to preserve integer precision.
+     * IMX296_EXPOSURE_OFFSET_US is a plain microsecond count, so it must be
+     * scaled into the same exposure_factor units as val before subtracting
+     * (with the default factor of 1000000 the scale is 1:1). Subtracting
+     * IMX296_EXPOSURE_OFFSET_US * exposure_factor here would subtract 14
+     * SECONDS, go negative for every legal val, wrap through u64 and leave
+     * the clamp below pinning exposure at maximum. Multiply first to
+     * preserve integer precision.
      */
+	exposure = val - (s64)IMX296_EXPOSURE_OFFSET_US *
+			   mode->control_properties.exposure_factor / 1000000;
+	if (exposure < 1)
+		exposure = 1;
+
 	coarse_time =
-		(u32)(mode->signal_properties.pixel_clock.val *
-		      (val - IMX296_EXPOSURE_OFFSET_US *
-				     mode->control_properties.exposure_factor) /
+		(u32)(mode->signal_properties.pixel_clock.val * exposure /
 		      mode->image_properties.line_length /
 		      mode->control_properties.exposure_factor);
 
