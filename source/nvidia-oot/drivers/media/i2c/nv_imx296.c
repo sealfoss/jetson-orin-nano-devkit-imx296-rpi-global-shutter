@@ -16,10 +16,16 @@
  * SECTION 1 - INCLUDES
  * ============================================================ */
 
-/* Must precede all includes: dev_dbg()'s macro expansion in
- * dev_printk.h keys off DEBUG at the point <linux/module.h> is
- * included below. */
-#define DEBUG
+/* Bring-up debug instrumentation. Defining DEBUG here (it must precede
+ * all includes: dev_dbg()'s macro expansion in dev_printk.h keys off
+ * DEBUG at the point <linux/module.h> is included below) enables
+ * dev_dbg() output, ~40-register dumps around every mode-set and stream
+ * start, and a 1 s post-start verification sleep — over a second of
+ * added latency per stream start, enough to eat into the VI/Argus
+ * frame-start timeout budget. Leave it off for normal use; re-enable it
+ * only when instrumenting bring-up.
+ */
+/* #define DEBUG */
 
 #include <nvidia/conftest.h>
 
