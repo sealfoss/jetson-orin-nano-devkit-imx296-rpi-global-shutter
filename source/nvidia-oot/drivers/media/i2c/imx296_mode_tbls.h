@@ -153,12 +153,19 @@ static const imx296_reg imx296_common_regs[] = {
 
 	/*
      * GAINDLY (0x3212): gain application delay
-     * 0x08 = GAINDLY_NONE:   gain applied immediately
-     * 0x09 = GAINDLY_1FRAME: gain applied after 1 frame
-     * libcamera sensorDelays.gainDelay = 2 frames, but we use
-     * immediate mode here and let the framework handle delays.
+     * 0x08 = GAINDLY_NONE:   gain applied immediately (mid-frame)
+     * 0x09 = GAINDLY_1FRAME: gain latched at the next frame boundary
+     *
+     * Use 1-frame mode, matching the RPi production driver's setup path
+     * (imx296_setup writes GAINDLY_1FRAME). SHS1/exposure changes latch
+     * at frame boundaries anyway, so with 1-frame mode an AE step's gain
+     * and exposure land on the SAME frame instead of the gain jumping
+     * mid-frame - each Argus AE adjustment produces one clean step, not
+     * a partially-applied frame. (libcamera models this as
+     * sensorDelays.gainDelay = 2: 1 frame register delay + 1 frame
+     * pipeline.)
      */
-	{ 0x3212, 0x08 }, /* GAINDLY: no delay */
+	{ 0x3212, 0x09 }, /* GAINDLY: 1-frame (RPi production value) */
 
 	/*
      * GAINCTRL (0x3200): gain control mode
