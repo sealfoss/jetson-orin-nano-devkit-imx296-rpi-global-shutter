@@ -148,8 +148,19 @@ static const imx296_reg imx296_common_regs[] = {
      * BLKLEVELAUTO (0x3022): automatic black level calibration
      * 0x01 = ON: sensor continuously calibrates black level
      * 0xf0 = OFF: use fixed BLKLEVEL value
+     *
+     * OFF, deviating from mainline/RPi (which run it ON outside test
+     * patterns). Measured on hardware (dark frames, 2026-07-28): the
+     * auto-calibration loop OSCILLATES - +/-1.5 counts at ~7-9 Hz at
+     * low gain, exploding to +/-35 counts at 38-44 Hz at gain 30 dB -
+     * visible as shadow/line flicker. A mid-stream register A/B cut
+     * black-level std 3.6x the moment it was disabled. The fixed
+     * BLKLEVEL=60 above matches what the RPi tuning data assumes, and
+     * both Argus and our ISP pipeline subtract a fixed 60. Tradeoff:
+     * no compensation for slow thermal dark-current drift (DC drift,
+     * not flicker) - revisit if long-session black drift appears.
      */
-	{ 0x3022, 0x01 }, /* BLKLEVELAUTO: enabled */
+	{ 0x3022, 0xf0 }, /* BLKLEVELAUTO: OFF - fixed black level (see above) */
 
 	/*
      * GAINDLY (0x3212): gain application delay
