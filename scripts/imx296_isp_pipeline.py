@@ -230,11 +230,11 @@ def load_raw(raw_path, width, height, stride):
             f"stride), got {raw.size} - wrong --width/--height, or preferred_stride "
             f"did not take effect (Bytes per Line should be {stride})"
         )
-    # Strip the per-line stride padding (stride - width*2 bytes at the end of
-    # each row) before reinterpreting as uint16 - viewing a byte-truncated
-    # (but still last-axis-contiguous) slice as uint16 is valid in numpy
-    # without an explicit copy.
-    return raw.reshape(height, stride)[:, : width * 2].view(np.uint16).reshape(height, width)
+    # Reinterpret as uint16 FIRST (the flat buffer is contiguous - always
+    # legal), THEN slice off the per-line stride padding. Slicing bytes
+    # before .view() leaves a non-contiguous array, which older numpy
+    # releases (e.g. the Orin's) reject with "must be C-contiguous".
+    return raw.view(np.uint16).reshape(height, stride // 2)[:, :width]
 
 
 def process_frame(raw16, fourcc, tuning, awb="auto", target_ct=4560, enhance=True):
