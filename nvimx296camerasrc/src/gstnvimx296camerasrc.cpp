@@ -2,8 +2,15 @@
  * nvimx296camerasrc: GStreamer source element for the RPi Global Shutter
  * Camera (Sony IMX296) on Jetson Orin, bypassing Argus entirely:
  *
- *   V4L2 RG10 capture (MMAP)  --HtoD-->  fused CUDA ISP  -->  NV12 in
- *   memory:NVMM buffers (NvBufSurface), pushed downstream.
+ *   V4L2 RG10 capture (DMABUF, zero-copy)  -->  fused CUDA ISP  -->  NV12
+ *   in memory:NVMM buffers (NvBufSurface), pushed downstream.
+ *
+ * Zero-copy capture: the VI DMAs each raw frame directly into an
+ * NvBufSurface dmabuf that is persistently EGL/CUDA-mapped; the surface
+ * pitch is imposed on the VI via the driver's preferred_stride control,
+ * so pitches match by construction (no remap_surf-style copies). If the
+ * driver refuses the negotiation the element falls back automatically to
+ * MMAP + pinned HtoD (zero-copy=false forces the fallback for A/B).
  *
  * Buffer conventions follow NVIDIA's own gst-nvv4l2camera/gst-nvarguscamera
  * (GstMemory of sizeof(NvBufSurface); mapped data IS the NvBufSurface*).
@@ -11,9 +18,6 @@
  * GPU cost is constant. See imx296_isp.cu for the kernel.
  *
  * Deliberate scope notes:
- *  - input HtoD copy (~0.3 ms) instead of dmabuf zero-copy capture: the
- *    driver's bytesperline vs NvBufSurface pitch mismatch handling (see
- *    nvv4l2camerasrc's remap_surf) is not worth the complexity at v1.
  *  - exposure/gain applied via V4L2 after streaming starts (mode-table
  *    default clobber + no-change-skip findings from bring-up), with the
  *    nudge trick.
@@ -54,6 +58,18 @@ typedef struct {
     int idx;
 } OutBuf;
 
+/* zero-copy capture buffer: the VI DMAs the RG10 frame straight into an
+ * NvBufSurface dmabuf that is persistently EGL/CUDA-mapped. The surface is
+ * a byte container (GRAY8, width*2 x height); its color-format tag is
+ * cosmetic - only pitch/size matter, and the driver's preferred_stride
+ * control is used to make the VI's stride EQUAL the surface pitch. */
+typedef struct {
+    NvBufSurface *surf;
+    CUgraphicsResource cures;
+    uint16_t *dptr;        /* device pointer to raw frame */
+    int fd;                /* dmabuf fd queued to V4L2 */
+} CapBuf;
+
 typedef struct _GstNvImx296CameraSrc {
     GstPushSrc parent;
 
@@ -70,7 +86,10 @@ typedef struct _GstNvImx296CameraSrc {
 
     /* v4l2 */
     int fd;
-    struct { void *start; size_t length; } capbuf[N_CAP_BUFS];
+    struct { void *start; size_t length; } capbuf[N_CAP_BUFS];  /* MMAP fallback */
+    CapBuf cap[N_CAP_BUFS];                                     /* zero-copy */
+    gboolean zerocopy_active;
+    gboolean prop_zerocopy;
     guint32 bytesperline;
     unsigned ctrl_id_exposure, ctrl_id_gain, ctrl_id_frame_rate, ctrl_id_stride;
     gboolean streaming;
@@ -106,7 +125,7 @@ enum {
     PROP_TONE_PRESET, PROP_CONTRAST, PROP_BRIGHTNESS, PROP_SATURATION,
     PROP_DIGITAL_GAIN, PROP_DITHER, PROP_BLACK_OFFSET,
     PROP_KNEE_POINT, PROP_KNEE_STRENGTH, PROP_TONE_LUT_FILE,
-    PROP_AWB_MODE, PROP_AWB_CT, PROP_FLIP180,
+    PROP_AWB_MODE, PROP_AWB_CT, PROP_FLIP180, PROP_ZEROCOPY,
 };
 
 #define TONE_PRESET_TYPE (tone_preset_get_type())
@@ -228,6 +247,120 @@ static gboolean v4l2_setup(GstNvImx296CameraSrc *self)
     GST_INFO_OBJECT(self, "V4L2 %dx%d RG10, bytesperline=%u",
                     self->width, self->height, self->bytesperline);
 
+    return TRUE;   /* buffers + STREAMON happen in v4l2_buffers_setup() */
+}
+
+/* Allocate one GRAY8 byte-container surface of the raw frame geometry and
+ * EGL/CUDA-map it. Returns FALSE on any failure (caller cleans up). */
+static gboolean capbuf_alloc(GstNvImx296CameraSrc *self, CapBuf *cb)
+{
+    NvBufSurfaceAllocateParams p;
+    memset(&p, 0, sizeof(p));
+    p.params.width = self->width * 2;      /* bytes per row of RG10 */
+    p.params.height = self->height;
+    p.params.layout = NVBUF_LAYOUT_PITCH;
+    p.params.memType = NVBUF_MEM_DEFAULT;
+    p.params.gpuId = 0;
+    p.params.colorFormat = NVBUF_COLOR_FORMAT_GRAY8;
+    if (NvBufSurfaceAllocate(&cb->surf, 1, &p) != 0) return FALSE;
+    cb->surf->numFilled = 1;
+    cb->fd = (int)cb->surf->surfaceList[0].bufferDesc;
+
+    if (NvBufSurfaceMapEglImage(cb->surf, 0) != 0) return FALSE;
+    if (cuGraphicsEGLRegisterImage(&cb->cures,
+            cb->surf->surfaceList[0].mappedAddr.eglImage,
+            CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE) != CUDA_SUCCESS) return FALSE;
+    CUeglFrame f;
+    if (cuGraphicsResourceGetMappedEglFrame(&f, cb->cures, 0, 0) != CUDA_SUCCESS)
+        return FALSE;
+    cb->dptr = (uint16_t *)f.frame.pPitch[0];
+    return TRUE;
+}
+
+static void capbufs_teardown(GstNvImx296CameraSrc *self)
+{
+    for (int i = 0; i < N_CAP_BUFS; i++) {
+        CapBuf *cb = &self->cap[i];
+        if (cb->cures) { cuGraphicsUnregisterResource(cb->cures); cb->cures = NULL; }
+        if (cb->surf) {
+            NvBufSurfaceUnMapEglImage(cb->surf, 0);
+            NvBufSurfaceDestroy(cb->surf);
+            cb->surf = NULL;
+        }
+        cb->dptr = NULL; cb->fd = -1;
+    }
+}
+
+/* Zero-copy path: allocate capture surfaces, force the VI's stride to the
+ * surface pitch via preferred_stride, and queue the dmabufs to V4L2.
+ * Requires CUDA/EGL to be initialized. Returns FALSE -> caller falls back
+ * to MMAP+HtoD. */
+static gboolean v4l2_buffers_setup_dmabuf(GstNvImx296CameraSrc *self)
+{
+    if (!self->prop_zerocopy || !self->ctrl_id_stride) return FALSE;
+
+    /* probe surface: what pitch does the allocator want for this width? */
+    if (!capbuf_alloc(self, &self->cap[0])) { capbufs_teardown(self); return FALSE; }
+    guint32 pitch = self->cap[0].surf->surfaceList[0].planeParams.pitch[0];
+    if (pitch & 63) { capbufs_teardown(self); return FALSE; }  /* VI needs 64-aligned */
+
+    /* re-negotiate the VI stride to exactly the surface pitch */
+    v4l2_set_ctrl64(self->fd, self->ctrl_id_stride, pitch);
+    struct v4l2_format fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width = self->width;
+    fmt.fmt.pix.height = self->height;
+    fmt.fmt.pix.pixelformat = v4l2_fourcc('R', 'G', '1', '0');
+    fmt.fmt.pix.field = V4L2_FIELD_NONE;
+    if (ioctl(self->fd, VIDIOC_S_FMT, &fmt) < 0) { capbufs_teardown(self); return FALSE; }
+    v4l2_set_ctrl64(self->fd, self->ctrl_id_stride, pitch);
+    if (ioctl(self->fd, VIDIOC_G_FMT, &fmt) < 0) { capbufs_teardown(self); return FALSE; }
+    if (fmt.fmt.pix.bytesperline != pitch) {
+        GST_WARNING_OBJECT(self,
+            "zero-copy: driver bytesperline %u != surface pitch %u - falling back",
+            fmt.fmt.pix.bytesperline, pitch);
+        capbufs_teardown(self);
+        return FALSE;
+    }
+    self->bytesperline = pitch;
+
+    for (int i = 1; i < N_CAP_BUFS; i++)
+        if (!capbuf_alloc(self, &self->cap[i])) { capbufs_teardown(self); return FALSE; }
+
+    struct v4l2_requestbuffers req;
+    memset(&req, 0, sizeof(req));
+    req.count = N_CAP_BUFS; req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_DMABUF;
+    if (ioctl(self->fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 2) {
+        GST_WARNING_OBJECT(self, "zero-copy: REQBUFS(DMABUF) failed - falling back");
+        capbufs_teardown(self);
+        return FALSE;
+    }
+    for (int i = 0; i < N_CAP_BUFS; i++) {
+        struct v4l2_buffer b;
+        memset(&b, 0, sizeof(b));
+        b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; b.memory = V4L2_MEMORY_DMABUF;
+        b.index = i; b.m.fd = self->cap[i].fd;
+        if (ioctl(self->fd, VIDIOC_QBUF, &b) < 0) {
+            GST_WARNING_OBJECT(self, "zero-copy: QBUF(DMABUF) failed: %s - falling back",
+                               g_strerror(errno));
+            struct v4l2_requestbuffers rel;
+            memset(&rel, 0, sizeof(rel));
+            rel.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; rel.memory = V4L2_MEMORY_DMABUF;
+            ioctl(self->fd, VIDIOC_REQBUFS, &rel);
+            capbufs_teardown(self);
+            return FALSE;
+        }
+    }
+    GST_INFO_OBJECT(self, "zero-copy capture active: %d dmabufs, stride %u",
+                    N_CAP_BUFS, pitch);
+    return TRUE;
+}
+
+/* MMAP + pinned-HtoD fallback (the proven v1 path). */
+static gboolean v4l2_buffers_setup_mmap(GstNvImx296CameraSrc *self)
+{
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
     req.count = N_CAP_BUFS; req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -249,6 +382,19 @@ static gboolean v4l2_setup(GstNvImx296CameraSrc *self)
         cudaHostRegister(self->capbuf[i].start, b.length, cudaHostRegisterDefault);
         if (ioctl(self->fd, VIDIOC_QBUF, &b) < 0) return FALSE;
     }
+    return TRUE;
+}
+
+static gboolean v4l2_buffers_setup(GstNvImx296CameraSrc *self)
+{
+    self->zerocopy_active = v4l2_buffers_setup_dmabuf(self);
+    if (!self->zerocopy_active) {
+        if (!v4l2_buffers_setup_mmap(self)) return FALSE;
+        /* MMAP path needs the device staging buffer */
+        if (cudaMallocPitch((void **)&self->d_raw, &self->d_raw_pitch,
+                            self->bytesperline, self->height) != cudaSuccess)
+            return FALSE;
+    }
 
     enum v4l2_buf_type t = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     if (ioctl(self->fd, VIDIOC_STREAMON, &t) < 0) {
@@ -266,6 +412,8 @@ static void v4l2_apply_controls(GstNvImx296CameraSrc *self)
     gint64 fr = (gint64)self->fps_n * 1000000 / (self->fps_d ? self->fps_d : 1);
     v4l2_set_ctrl64_nudge(self->fd, self->ctrl_id_frame_rate, fr, 1000000);
 }
+
+static void capbufs_teardown(GstNvImx296CameraSrc *self);  /* fwd */
 
 static void v4l2_teardown(GstNvImx296CameraSrc *self)
 {
@@ -285,6 +433,9 @@ static void v4l2_teardown(GstNvImx296CameraSrc *self)
         close(self->fd);
         self->fd = -1;
     }
+    /* after STREAMOFF + close the VI holds no references to the dmabufs */
+    capbufs_teardown(self);
+    self->zerocopy_active = FALSE;
 }
 
 /* ================== EGL / CUDA / pool ================== */
@@ -440,9 +591,9 @@ static gboolean nvimx296_set_caps(GstBaseSrc *bsrc, GstCaps *caps)
     if (!self->stream) {          /* one-time CUDA/EGL init */
         if (!egl_cuda_init_once(self)) return FALSE;
     }
-    if (cudaMallocPitch((void **)&self->d_raw, &self->d_raw_pitch,
-                        self->bytesperline, self->height) != cudaSuccess)
-        return FALSE;
+    cuCtxSetCurrent(self->cuctx);
+    /* buffer setup needs CUDA/EGL live (zero-copy capture surfaces) */
+    if (!v4l2_buffers_setup(self)) return FALSE;
     if (!pool_setup(self)) return FALSE;
 
     self->core = isp_core_create(&self->tuning, &self->isp_params,
@@ -525,11 +676,14 @@ static GstFlowReturn nvimx296_create(GstPushSrc *psrc, GstBuffer **outbuf)
     }
     struct v4l2_buffer b;
     memset(&b, 0, sizeof(b));
-    b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; b.memory = V4L2_MEMORY_MMAP;
+    b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    b.memory = self->zerocopy_active ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
     if (ioctl(self->fd, VIDIOC_DQBUF, &b) < 0) {
         GST_ELEMENT_ERROR(self, RESOURCE, READ, ("DQBUF: %s", g_strerror(errno)), (NULL));
         return GST_FLOW_ERROR;
     }
+    if (self->zerocopy_active) /* QBUF wants the fd repopulated */
+        b.m.fd = self->cap[b.index].fd;
 
     /* 3. late control (re)apply: first frames + property changes */
     if (self->ctrl_dirty) {
@@ -544,15 +698,24 @@ static GstFlowReturn nvimx296_create(GstPushSrc *psrc, GstBuffer **outbuf)
         isp_core_update_params(self->core, &p);
     }
 
-    /* 4. HtoD + fused kernel + sync, then requeue the capture buffer */
+    /* 4. fused kernel + sync, then requeue the capture buffer.
+     * zero-copy: the kernel reads the VI's dmabuf in place (pitch ==
+     * bytesperline by construction). MMAP fallback: pinned HtoD first. */
     cuCtxSetCurrent(self->cuctx);
-    cudaMemcpy2DAsync(self->d_raw, self->d_raw_pitch,
-                      self->capbuf[b.index].start, self->bytesperline,
-                      self->width * 2, self->height,
-                      cudaMemcpyHostToDevice, self->stream);
-    isp_core_process_nv12(self->core, self->d_raw, self->d_raw_pitch,
-                          ob->dY, ob->pitchY, ob->dUV, ob->pitchUV,
-                          (unsigned)self->frame_no);
+    if (self->zerocopy_active) {
+        isp_core_process_nv12(self->core, self->cap[b.index].dptr,
+                              self->bytesperline,
+                              ob->dY, ob->pitchY, ob->dUV, ob->pitchUV,
+                              (unsigned)self->frame_no);
+    } else {
+        cudaMemcpy2DAsync(self->d_raw, self->d_raw_pitch,
+                          self->capbuf[b.index].start, self->bytesperline,
+                          self->width * 2, self->height,
+                          cudaMemcpyHostToDevice, self->stream);
+        isp_core_process_nv12(self->core, self->d_raw, self->d_raw_pitch,
+                              ob->dY, ob->pitchY, ob->dUV, ob->pitchUV,
+                              (unsigned)self->frame_no);
+    }
     cudaError_t ce = cudaStreamSynchronize(self->stream);
     ioctl(self->fd, VIDIOC_QBUF, &b);
     if (ce != cudaSuccess) {
@@ -609,6 +772,7 @@ static void nvimx296_set_property(GObject *obj, guint prop_id,
     case PROP_AWB_MODE: self->isp_params.awb = (AwbMode)g_value_get_enum(value); self->params_dirty = TRUE; break;
     case PROP_AWB_CT: self->isp_params.awb_ct = g_value_get_double(value); self->params_dirty = TRUE; break;
     case PROP_FLIP180: self->isp_params.flip180 = g_value_get_boolean(value); self->params_dirty = TRUE; break;
+    case PROP_ZEROCOPY: self->prop_zerocopy = g_value_get_boolean(value); break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, prop_id, pspec); break;
     }
     g_mutex_unlock(&self->lock);
@@ -636,6 +800,7 @@ static void nvimx296_get_property(GObject *obj, guint prop_id,
     case PROP_AWB_MODE: g_value_set_enum(value, self->isp_params.awb); break;
     case PROP_AWB_CT: g_value_set_double(value, self->isp_params.awb_ct); break;
     case PROP_FLIP180: g_value_set_boolean(value, self->isp_params.flip180); break;
+    case PROP_ZEROCOPY: g_value_set_boolean(value, self->prop_zerocopy); break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID(obj, prop_id, pspec); break;
     }
 }
@@ -719,6 +884,11 @@ static void gst_nvimx296camerasrc_class_init(GstNvImx296CameraSrcClass *klass)
     g_object_class_install_property(gobject, PROP_AWB_MODE,
         g_param_spec_enum("awb", "AWB mode", "White balance mode",
             AWB_MODE_TYPE, AWB_AUTO, PFLAGS));
+    g_object_class_install_property(gobject, PROP_ZEROCOPY,
+        g_param_spec_boolean("zero-copy", "Zero-copy capture",
+            "Capture via V4L2 DMABUF directly into GPU-mapped surfaces "
+            "(auto-falls back to MMAP+copy if the driver refuses)",
+            TRUE, (GParamFlags)(G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS)));
     g_object_class_install_property(gobject, PROP_FLIP180,
         g_param_spec_boolean("flip", "Flip 180",
             "Rotate output 180 degrees (upside-down camera mount)",
@@ -743,6 +913,8 @@ static void gst_nvimx296camerasrc_init(GstNvImx296CameraSrc *self)
     self->exposure_us = 8333;
     self->gain = 60;
     self->fd = -1;
+    self->prop_zerocopy = TRUE;
+    for (int i = 0; i < N_CAP_BUFS; i++) self->cap[i].fd = -1;
     isp_params_defaults(&self->isp_params);
     g_mutex_init(&self->lock);
 

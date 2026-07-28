@@ -74,10 +74,13 @@ exact element kernel on a canned raw capture and dumps RGB8; compare against
 `scripts/imx296_isp_pipeline.py --input raw.bin --awb tuning --ct <ct>`.
 Also prints kernel-only timing for the production NV12 path.
 
-## Known v1 scope
+## Scope notes
 
-- Input is V4L2 MMAP + one HtoD copy (~0.3 ms), not dmabuf zero-copy capture
-  (driver bytesperline vs NvBufSurface pitch remapping isn't worth it yet).
-  Output side is fully zero-copy NVMM.
+- **Fully zero-copy end to end**: the VI DMAs raw frames straight into
+  EGL/CUDA-mapped NvBufSurface dmabufs (V4L2_MEMORY_DMABUF; the surface
+  pitch is imposed on the VI via `preferred_stride`), the kernel reads them
+  in place, and output NVMM surfaces go downstream without copies. If the
+  dmabuf negotiation fails the element falls back to MMAP + pinned HtoD
+  automatically (`zero-copy=false` forces the fallback for comparison).
 - NV12 8-bit out only (P010 dead-ends downstream: nvivafilter etc. are 8-bit).
 - Single element instance per sensor; 1456×1088 and 1280×720 modes.
