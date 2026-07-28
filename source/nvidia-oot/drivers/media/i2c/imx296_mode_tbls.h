@@ -78,13 +78,19 @@ static const imx296_reg imx296_common_regs[] = {
 	{ 0x30ac, 0x28 }, /* undocumented */
 	/*
      * 0x30af: the ONLY byte on which the two reference drivers disagree.
-     * Mainline imx296.c ships 0x09; the Raspberry Pi kernel driver — the
-     * only stack known to run the RPi Global Shutter Camera cleanly — has
-     * shipped 0x0b since its driver-add commit. Prime suspect for the
-     * black horizontal line seen on every capture with 0x09; use the RPi
-     * production value.
+     * Mainline imx296.c ships 0x09, and the Raspberry Pi kernel driver
+     * originally shipped 0x09 too (driver-add commit cb33db2b6ccf). RPi
+     * changed it to 0x0b in commit dca33feaec31 (2024-03-04, "Updated
+     * register setting to fix Fast Trigger"): per that commit, on Sony's
+     * recommendation, 0x0b fixes a MIPI Frame End packet not being sent
+     * at end of frame. The current RPi production driver applies 0x0b
+     * unconditionally in all modes, and a missing/late FE packet is a
+     * plausible contributor to per-frame VI capture artifacts (the black
+     * line seen on every capture with 0x09), so adopt 0x0b — but note
+     * the artifact link is a hypothesis to verify on hardware, not an
+     * established cause.
      */
-	{ 0x30af, 0x0b }, /* undocumented (RPi GS production value; mainline: 0x09) */
+	{ 0x30af, 0x0b }, /* undocumented (RPi production value; mainline: 0x09) */
 	{ 0x30df, 0x00 }, /* undocumented */
 	{ 0x3165, 0x00 }, /* undocumented */
 	{ 0x3169, 0x10 }, /* undocumented */
@@ -299,7 +305,10 @@ static const imx296_reg imx296_1456x1088_regs[] = {
  * MIPIC_AREA3W must match the cropped output height (the RPi driver
  * writes crop->height there), overriding the 1088 from common_regs.
  * VMAX=750 also overrides common_regs' 1118 default; set_frame_rate()
- * recomputes it from the DT mode1 framerate range at stream start.
+ * then recomputes VMAX from the requested framerate, floored at the
+ * mode-relative minimum (active_h + 30 = 750 for this mode — see
+ * imx296_min_frame_length(); a fixed 1118 floor would clamp 90 fps
+ * back to ~60).
  */
 static const imx296_reg imx296_1280x720_regs[] = {
 	{ 0x300d, 0x00 }, /* CTRL0D: full readout mode, no binning */

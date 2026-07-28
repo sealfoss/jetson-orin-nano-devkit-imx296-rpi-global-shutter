@@ -88,7 +88,8 @@
 #define IMX296_VMAX_ADDR_MID 0x3011 /* VMAX[15:8] */
 #define IMX296_VMAX_ADDR_HIGH 0x3012 /* VMAX[22:16] only bits[2:0] used */
 #define IMX296_VMAX_MAX 0x1FFFF /* 17-bit max */
-#define IMX296_VMAX_MIN (IMX296_PIXEL_ARRAY_HEIGHT + 30)
+#define IMX296_VBLANK_MIN 30 /* min vertical blanking lines (mainline default) */
+#define IMX296_VMAX_MIN (IMX296_PIXEL_ARRAY_HEIGHT + IMX296_VBLANK_MIN)
 
 /* ---- Line length (HMAX) - 16-bit little-endian, 2 registers ----
  * Fixed at 1100 in 74.25MHz clock units (from mainline driver).
@@ -570,6 +571,29 @@ static int imx296_set_gain(struct tegracam_device *tc_dev, s64 val)
 	return 0;
 }
 
+/*
+ * Minimum frame length (VMAX floor) for the CURRENTLY SELECTED mode:
+ * active output height plus the 30-line minimum vertical blanking.
+ * A fixed full-frame floor (1088+30=1118) would clamp away the 720p
+ * crop's VMAX=750 and silently cap that mode at ~60 fps, and would
+ * also break set_exposure()'s frame_length fallback for cropped modes
+ * (SHS1 computed against 1118 while the sensor runs VMAX=750).
+ */
+static u32 imx296_min_frame_length(struct camera_common_data *s_data)
+{
+	const struct sensor_mode_properties *mode;
+
+	if (s_data->mode_prop_idx < 0 ||
+	    s_data->mode_prop_idx >= s_data->sensor_props.num_modes)
+		return IMX296_VMAX_MIN;
+
+	mode = &s_data->sensor_props.sensor_modes[s_data->mode_prop_idx];
+	if (mode->image_properties.height == 0)
+		return IMX296_VMAX_MIN;
+
+	return mode->image_properties.height + IMX296_VBLANK_MIN;
+}
+
 static int imx296_set_frame_rate(struct tegracam_device *tc_dev, s64 val)
 {
 	struct camera_common_data *s_data = tc_dev->s_data;
@@ -599,8 +623,8 @@ static int imx296_set_frame_rate(struct tegracam_device *tc_dev, s64 val)
 		       mode->control_properties.framerate_factor /
 		       mode->image_properties.line_length / val;
 
-	frame_length =
-		clamp_t(u32, frame_length, IMX296_VMAX_MIN, IMX296_VMAX_MAX);
+	frame_length = clamp_t(u32, frame_length,
+			       imx296_min_frame_length(s_data), IMX296_VMAX_MAX);
 
 	priv->frame_length = frame_length;
 
@@ -672,7 +696,7 @@ static int imx296_set_exposure(struct tegracam_device *tc_dev, s64 val)
 		      mode->control_properties.exposure_factor);
 
 	if (priv->frame_length == 0)
-		priv->frame_length = IMX296_VMAX_MIN;
+		priv->frame_length = imx296_min_frame_length(s_data);
 
 	/*
      * IMX296 exposure via SHS1 (shutter speed, inverted):
