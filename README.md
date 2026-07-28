@@ -58,13 +58,12 @@ The files under `source/` mirror the L4T `Linux_for_Tegra/source` layout and
 copy straight on top of it.
 
 **Companion project:** the recommended way to *consume* this driver is
-[`nvimx296camerasrc`](../nvimx296camerasrc/) (sibling directory in the parent
-project) — a GStreamer source element with a fused CUDA ISP that uses the
-real RPi/libcamera tuning data and replaces `nvarguscamerasrc`/Argus
-entirely: no AE hunting, no TNR, correct color, zero-copy from sensor DMA to
-`memory:NVMM` NV12 at 60/90 fps. It was developed in this repo (see git
-history through the `feat/cuda-isp` / `feat/zero-copy-capture` merges) and
-now lives as its own CMake project.
+[`nvimx296camerasrc`][nvimx296camerasrc] — a GStreamer source element with a
+fused CUDA ISP that uses the real RPi/libcamera tuning data and replaces
+`nvarguscamerasrc`/Argus entirely: no AE hunting, no TNR, correct color,
+zero-copy from sensor DMA to `memory:NVMM` NV12 at 60/90 fps. It began life
+in this repo (see git history through the `feat/cuda-isp` /
+`feat/zero-copy-capture` merges) and is maintained as its own CMake project.
 
 ## Build
 
@@ -135,7 +134,7 @@ python3 scripts/imx296_isp_pipeline.py --input frame.raw   # -> color PNG (auto 
 ```
 
 **Best quality / live** — use the companion
-[`nvimx296camerasrc`](../nvimx296camerasrc/) element (see above).
+[`nvimx296camerasrc`][nvimx296camerasrc] element (see above).
 
 **Via Argus** (`nvarguscamerasrc`) — works, but Argus has no tuning profile
 for this sensor: colors are approximate and the untuned auto-exposure loop
@@ -186,3 +185,7 @@ is dB×10, 0–480, halve exposure ⇒ +60 gain.)
 ## License
 
 GPL-2.0, see [LICENSE](LICENSE).
+
+<!-- Companion-repo link: update this ONE definition when the
+     nvimx296camerasrc repository is published. -->
+[nvimx296camerasrc]: https://github.com/TODO/nvimx296camerasrc
