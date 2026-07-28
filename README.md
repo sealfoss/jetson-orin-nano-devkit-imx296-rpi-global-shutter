@@ -84,6 +84,22 @@ after adjusting the hardcoded paths.)
 
 ## Install on the target
 
+**Scripted** — copy `nv_imx296.ko`, the `.dtbo` of your choice, and
+`scripts/install.sh` to the Jetson, then:
+
+```bash
+sudo ./install.sh                    # module + depmod + dtbo + auto-load +
+                                     # a NON-default extlinux boot entry
+sudo ./install.sh --set-default      # later, once you trust the camera boot
+```
+
+It hard-refuses on a `.ko`/kernel vermagic mismatch, backs up
+`extlinux.conf`, never edits existing labels, and clones your current
+default entry (so jetson-io header configs survive). `--dry-run` shows every
+action first; `--variant A|C|dual` picks the overlay; `--help` for the rest.
+
+**Or by hand:**
+
 1. Copy the `.dtbo`(s) to `/boot/` and the `.ko` somewhere convenient.
 2. Add a **non-default** extlinux label (keep your known-good default
    bootable — a bad camera boot then costs one power-cycle, nothing more):
