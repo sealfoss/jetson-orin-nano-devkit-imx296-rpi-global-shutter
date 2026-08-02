@@ -108,19 +108,28 @@ infrastructure: a Jetson hardware PWM channel or timer-driven GPIO,
 configured before the pipeline starts. A userspace GPIO toggle loop is
 not acceptable — its jitter defeats the purpose.
 
-Hardware notes:
+Hardware facts (from Raspberry Pi's official *"External trigger on the
+GS camera"* documentation, checked 2026-08-02):
 
-- The XTR pad is exposed on the RPi GS camera board. Consult Raspberry
-  Pi's *"External trigger on the GS camera"* documentation for the pad
-  location, signal polarity, and level requirements **before wiring** —
-  the sensor side is 1.8 V logic territory; do not assume 3.3 V tolerance.
-- Pulse width = exposure time. The pulse train period sets the frame
-  rate; don't exceed the mode's free-run maximum (~60 fps full frame,
-  ~90 fps in the 720p crop — the readout still takes a full readout time
-  per frame).
-- **Not yet validated with real pulses** — the no-pulse and register
-  paths are hardware-validated, but the first wired pulse test should
-  confirm polarity and minimum/maximum pulse widths against the RPi docs.
+- The trigger goes to the **XTR and GND touchpoints on the back of the
+  camera PCB** — it is NOT carried on the CSI/FFC ribbon. Solder a fine
+  wire to each; the ribbon and everything Jetson-side stay unchanged.
+- **XTR is a 1.8 V input.** The official recipe for a 3.3 V driver
+  (their example is a Pi Pico on GPIO 28) is a potential divider:
+  **1.5 kΩ in series, 1.8 kΩ to ground** → 1.8 V at the pad.
+- **Active LOW, pulse width = exposure**: "the exposure time is equal to
+  the low pulse-width time plus an additional 14.26 µs". Idle level is
+  high; pull XTR low for the exposure duration. Pulse frequency =
+  framerate ("a PWM frequency of 30 Hz leads to a framerate of 30 fps").
+- **Board mod check**: if the camera board has transistor **Q2** fitted,
+  **remove R11** — required for external trigger operation (per the
+  official docs; check both boards).
+- Don't exceed the mode's free-run maximum rate (~60 fps full frame,
+  ~90 fps in the 720p crop — readout still takes a full readout time per
+  frame).
+- **Not yet validated with real pulses on this rig** — the no-pulse and
+  register paths are hardware-validated; the first wired pulse test
+  should sanity-check exposure-vs-low-width scaling.
 
 ### 5. Timestamping interaction
 
