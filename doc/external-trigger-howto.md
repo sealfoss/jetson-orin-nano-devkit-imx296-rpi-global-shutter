@@ -69,6 +69,37 @@ smoke test: armed = stream produces nothing; disarmed = free-run returns
 (validated on orion 2026-08-01: 0 frames in 8 s armed, 60.38 fps after
 clearing).
 
+### 3b. Configuring the device tree (cameras + PWM pin)
+
+`scripts/configure_camera_dt.py` (run ON the Jetson, modeled on
+`/opt/nvidia/jetson-io/jetson-io.py`) sets up the boot device tree for the
+camera layout and, optionally, a 40-pin-header PWM pin for the trigger
+line:
+
+```bash
+sudo ./configure_camera_dt.py --cams dual --pwm 32 --set-default --reboot
+sudo ./configure_camera_dt.py --cams a               # single cam, CAM0/J20
+./configure_camera_dt.py --list                      # inspect, no root
+```
+
+It clones the current default boot entry into a script-owned label
+(`imx296io`), swaps in the chosen IMX296 overlay, and — for `--pwm` —
+regenerates the jetson-io header overlay via NVIDIA's own
+`config-by-function.py`, which is **cumulative** (existing header pins
+such as a GPS UART survive). The overlay stack is preflighted with
+`fdtoverlay` before anything is written; existing labels are never
+edited and `extlinux.conf` is backed up. PWM pins: 15 = pwm1
+(pwmchip for `3280000.pwm`), 32 = pwm7 (`32e0000.pwm`), 33 = pwm5
+(`32c0000.pwm`). A reboot is required (`--reboot`).
+
+> **PWM rate limit (measured on orion, L4T r36):** the PWM controllers
+> are clocked at 408 MHz and the divider tops out at 256×8192, so sysfs
+> accepts periods only up to ~5.1 ms (≥ ~195 Hz). **30–90 Hz trigger
+> rates need the PWM clock reparented to the 32 kHz source** (small DT
+> fragment on the pwm node — pending validation) or an external pulse
+> source (e.g. the flight controller). Pin-mux and chip enablement are
+> validated end-to-end; only the slow-rate clocking remains open.
+
 ### 4. Drive the XTR line
 
 Pulse generation is deliberately **not** in this driver (or the GStreamer
