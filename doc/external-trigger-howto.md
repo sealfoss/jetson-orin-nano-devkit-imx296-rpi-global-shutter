@@ -92,13 +92,32 @@ edited and `extlinux.conf` is backed up. PWM pins: 15 = pwm1
 (pwmchip for `3280000.pwm`), 32 = pwm7 (`32e0000.pwm`), 33 = pwm5
 (`32c0000.pwm`). A reboot is required (`--reboot`).
 
-> **PWM rate limit (measured on orion, L4T r36):** the PWM controllers
-> are clocked at 408 MHz and the divider tops out at 256×8192, so sysfs
-> accepts periods only up to ~5.1 ms (≥ ~195 Hz). **30–90 Hz trigger
-> rates need the PWM clock reparented to the 32 kHz source** (small DT
-> fragment on the pwm node — pending validation) or an external pulse
-> source (e.g. the flight controller). Pin-mux and chip enablement are
-> validated end-to-end; only the slow-rate clocking remains open.
+> **PWM trigger rates — SOLVED via clock overlay (validated on orion
+> 2026-08-03):** stock, the PWM controllers run from 408 MHz and the
+> 13-bit divider caps sysfs periods at ~5.1 ms (≥ ~195 Hz). The overlay
+> `tegra234-p3767-imx296-trigger-pwm7-clk.dtbo` (source in
+> `source/hardware/.../overlay/`, standalone `dtc -@` build) reparents
+> PWM7 to `clk_m` (19.2 MHz) → periods from ~13 µs to 109 ms with
+> **exact 30.000 / 60.000 / 120.000 Hz**. Wire it into the boot entry:
+>
+> ```bash
+> sudo ./configure_camera_dt.py --cams dual --pwm 32 \
+>     --extra-overlay /boot/tegra234-p3767-imx296-trigger-pwm7-clk.dtbo \
+>     --set-default --reboot
+> # after boot:
+> echo 0        > /sys/class/pwm/pwmchipN/export     # N: chip of 32e0000.pwm
+> echo 16666666 > .../pwm0/period                    # 60.000 Hz
+> echo 5000000  > .../pwm0/duty_cycle                # 5 ms pulse = exposure
+> echo 1        > .../pwm0/enable
+> ```
+>
+> Two hardware realities: the Tegra PWM **cannot invert** (idle-low,
+> HIGH pulses; scope pin 32 accordingly) while XTR is active-low — so
+> drive XTR through an **inverting MOSFET/open-drain level stage** (which
+> the 1.8 V shift needs anyway); and duty resolution is 8-bit, so
+> exposure quantizes to period/256 (65.1 µs at 60 Hz) — measure the real
+> pulse width and set the element's `exposure` property to the measured
+> value.
 
 ### 4. Drive the XTR line
 
@@ -114,9 +133,15 @@ GS camera"* documentation, checked 2026-08-02):
 - The trigger goes to the **XTR and GND touchpoints on the back of the
   camera PCB** — it is NOT carried on the CSI/FFC ribbon. Solder a fine
   wire to each; the ribbon and everything Jetson-side stay unchanged.
-- **XTR is a 1.8 V input.** The official recipe for a 3.3 V driver
-  (their example is a Pi Pico on GPIO 28) is a potential divider:
-  **1.5 kΩ in series, 1.8 kΩ to ground** → 1.8 V at the pad.
+- **XTR is a 1.8 V input.** Two ways to drive it from 3.3 V logic:
+  - *Non-inverting divider* (the official Pico recipe, GPIO 28):
+    **1.5 kΩ series, 1.8 kΩ to ground** → 1.8 V at the pad. Use with a
+    source that can idle high and pulse low itself (Pico can).
+  - *Inverting open-drain/MOSFET stage* (e.g. 2N7000/BSS138 pulling XTR
+    low, gate driven by the PWM, pull-up network to ~1.8 V): required
+    for the **Jetson PWM** source, whose polarity cannot be inverted —
+    the stage turns its idle-low/high-pulse output into the active-low
+    XTR waveform, and clamps the level in the same move.
 - **Active LOW, pulse width = exposure**: "the exposure time is equal to
   the low pulse-width time plus an additional 14.26 µs". Idle level is
   high; pull XTR low for the exposure duration. Pulse frequency =

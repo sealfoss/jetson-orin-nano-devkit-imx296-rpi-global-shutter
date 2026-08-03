@@ -291,6 +291,11 @@ def main():
                     help='enable a 40-pin header PWM pin for the camera '
                          'trigger line (15=pwm1, 32=pwm7, 33=pwm5); '
                          'repeatable')
+    ap.add_argument('--extra-overlay', action='append', default=[],
+                    metavar='DTBO',
+                    help='additional overlay to include in the boot entry '
+                         '(repeatable), e.g. /boot/tegra234-p3767-imx296-'
+                         'trigger-pwm7-clk.dtbo for exact-60Hz trigger PWM')
     ap.add_argument('--label', default='imx296io',
                     help='extlinux label owned by this script '
                          '(default: %(default)s)')
@@ -338,6 +343,11 @@ def main():
 
     overlays = build_overlay_list(conf, src_label, cam_overlay,
                                   want_hdr40=bool(pwm_pins))
+    for extra in args.extra_overlay:
+        if not os.path.isfile(extra):
+            die('extra overlay not found: {}'.format(extra))
+        if extra not in overlays:
+            overlays.append(extra)
     base_fdt = conf.label_field(src_label, 'FDT')
     if not base_fdt:
         cands = sorted(glob.glob(os.path.join(BOOT, 'dtb', 'kernel_*.dtb')))
