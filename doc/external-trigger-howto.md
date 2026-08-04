@@ -104,12 +104,23 @@ edited and `extlinux.conf` is backed up. PWM pins: 15 = pwm1
 > sudo ./configure_camera_dt.py --cams dual --pwm 32 \
 >     --extra-overlay /boot/tegra234-p3767-imx296-trigger-pwm7-clk.dtbo \
 >     --set-default --reboot
-> # after boot:
-> echo 0        > /sys/class/pwm/pwmchipN/export     # N: chip of 32e0000.pwm
-> echo 16666666 > .../pwm0/period                    # 60.000 Hz
-> echo 5000000  > .../pwm0/duty_cycle                # 5 ms pulse = exposure
-> echo 1        > .../pwm0/enable
+> # after boot, drive the train with the helper (any rate ~10..75000 Hz,
+> # changeable at runtime; 20/30/60/120 Hz are exact, others round to
+> # 19.2MHz/(256*n), e.g. 45 -> 44.99 Hz):
+> sudo scripts/trigger_pwm.sh 60 5000            # 60 Hz, 5 ms exposure,
+>                                                # inverted (divider wiring)
+> sudo scripts/trigger_pwm.sh 45 5000 normal     # MOSFET-stage wiring
+> sudo scripts/trigger_pwm.sh park               # line high, camera idle
+> sudo scripts/trigger_pwm.sh status
 > ```
+>
+> `inverted` mode (default) emits idle-high/low-pulse via duty inversion
+> (duty = period − exposure) so the plain 1.5k/1.8k divider needs no
+> transistor — the trade: every OFF state (disable, reboot, crash) parks
+> the line LOW = XTR asserted, so pause with `park`, not `off`, and
+> discard the first (overexposed) frame after arming. `normal` mode is
+> for the inverting MOSFET stage, which parks safe in all OFF states —
+> preferred for flight.
 >
 > Two hardware realities: the Tegra PWM **cannot invert** (idle-low,
 > HIGH pulses; scope pin 32 accordingly) while XTR is active-low — so
