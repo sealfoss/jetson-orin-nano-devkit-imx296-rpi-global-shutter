@@ -80,6 +80,26 @@
 #define IMX296_CTRL0E_VREVERSE BIT(0) /* vertical flip */
 #define IMX296_CTRL0E_HREVERSE BIT(1) /* horizontal mirror */
 
+/* ---- External trigger (XTR pin) ----
+ * CTRL0B bit0 enables external trigger; LOWLAGTRG bit0 selects the
+ * "fast trigger" variant the RPi GS camera uses, in which the XTR
+ * pulse WIDTH sets the exposure time (SHS1 does not apply) and each
+ * pulse produces one frame (VMAX does not apply). Register pair and
+ * write position (between standby-exit and MIPI start) match the
+ * Raspberry Pi kernel driver's trigger_mode=1 path.
+ */
+#define IMX296_CTRL0B_ADDR 0x300b
+#define IMX296_CTRL0B_TRIGEN BIT(0)
+#define IMX296_LOWLAGTRG_ADDR 0x30ae
+#define IMX296_LOWLAGTRG_FAST BIT(0)
+
+/* Custom V4L2 control ID for trigger mode: tegracam has no trigger CID,
+ * so this lives in the TEGRA_CAMERA_CID space well above the last
+ * framework-defined ID (BASE+130) and the VI channel controls
+ * (BASE+100..111).
+ */
+#define IMX296_CID_TRIGGER_MODE (TEGRA_CAMERA_CID_BASE + 200)
+
 /* ---- Frame length (VMAX) - 24-bit little-endian, 3 registers ----
  * Total lines per frame including active and blanking lines.
  * line 0 = LSB at lowest address (little-endian).
@@ -166,6 +186,7 @@ struct imx296 {
 	bool mono; /* true = IMX296LL monochrome */
 	bool v_flip;
 	bool h_mirror;
+	bool trigger_mode; /* external (XTR) trigger; applied at stream start */
 	struct camera_common_data *s_data;
 	struct tegracam_device *tc_dev;
 };
@@ -752,6 +773,45 @@ static int imx296_fill_string_ctrl(struct tegracam_device *tc_dev,
 	return 0;
 }
 
+/*
+ * Custom (non-tegracam) V4L2 control: trigger_mode.
+ * The tegracam framework only routes its fixed TEGRA_CAMERA_CID_* list,
+ * so this control is registered directly on the subdev control handler
+ * in probe with its own ops. s_ctrl only records the value; the sensor
+ * registers are programmed at stream start (the RPi driver does the
+ * same - trigger mode is not switchable mid-stream).
+ */
+static int imx296_s_custom_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct imx296 *priv = ctrl->priv;
+
+	switch (ctrl->id) {
+	case IMX296_CID_TRIGGER_MODE:
+		priv->trigger_mode = ctrl->val;
+		dev_dbg(priv->s_data->dev,
+			"trigger_mode=%d (applies at next stream start)\n",
+			ctrl->val);
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
+static const struct v4l2_ctrl_ops imx296_custom_ctrl_ops = {
+	.s_ctrl = imx296_s_custom_ctrl,
+};
+
+static const struct v4l2_ctrl_config imx296_trigger_mode_ctrl_cfg = {
+	.ops = &imx296_custom_ctrl_ops,
+	.id = IMX296_CID_TRIGGER_MODE,
+	.name = "Trigger Mode",
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.min = 0,
+	.max = 1,
+	.step = 1,
+	.def = 0,
+};
+
 /* ============================================================
  * SECTION 11 - TEGRACAM CTRL OPS
  * Must appear AFTER all control handler functions it references.
@@ -1033,6 +1093,28 @@ static int imx296_start_streaming(struct tegracam_device *tc_dev)
     */
 	usleep_range(300000, 301000); /* 300ms */
 
+	/*
+	 * Program trigger mode while the sensor is out of standby but MIPI
+	 * output has not started - the same slot the RPi driver uses. Both
+	 * registers are written unconditionally so a free-run start always
+	 * clears a previous triggered session. In fast trigger mode frame
+	 * timing AND exposure come from the XTR pulse train (pulse width =
+	 * exposure time); SHS1/VMAX have no effect while triggered.
+	 */
+	err = imx296_write_reg(s_data, IMX296_CTRL0B_ADDR,
+			       priv->trigger_mode ? IMX296_CTRL0B_TRIGEN : 0);
+	if (err)
+		goto fail;
+
+	err = imx296_write_reg(s_data, IMX296_LOWLAGTRG_ADDR,
+			       priv->trigger_mode ? IMX296_LOWLAGTRG_FAST : 0);
+	if (err)
+		goto fail;
+
+	if (priv->trigger_mode)
+		dev_info(dev,
+			 "external trigger mode: frames follow XTR pulses\n");
+
 	err = imx296_write_reg(s_data, IMX296_CTRL0A_ADDR, 0);
 	if (err)
 		goto fail;
@@ -1108,8 +1190,45 @@ static int imx296_open(struct v4l2_subdev *sd, struct v4l2_subdev_fh *fh)
 	return 0;
 }
 
+/*
+ * Add the custom trigger_mode control from the .registered callback, NOT
+ * from probe after tegracam_v4l2subdev_register() returns. That function's
+ * last step is v4l2_async_register_subdev(); when the VI notifier is
+ * already waiting (the normal boot/insmod order), notify_complete runs
+ * synchronously inside it and tegra_channel_setup_controls() snapshots the
+ * subdev's controls into /dev/videoN at that instant - controls added
+ * afterwards never propagate to the video node. .registered runs during
+ * v4l2_device_register_subdev() inside the notifier's bound step, before
+ * notify_complete, in every load order.
+ */
+static int imx296_subdev_registered(struct v4l2_subdev *sd)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(sd);
+	struct camera_common_data *s_data = to_camera_common_data(&client->dev);
+	struct imx296 *priv;
+
+	if (!s_data || !s_data->ctrl_handler)
+		return -EINVAL;
+	priv = (struct imx296 *)s_data->priv;
+
+	if (v4l2_ctrl_find(s_data->ctrl_handler, IMX296_CID_TRIGGER_MODE))
+		return 0;
+
+	if (!v4l2_ctrl_new_custom(s_data->ctrl_handler,
+				  &imx296_trigger_mode_ctrl_cfg, priv)) {
+		dev_err(&client->dev,
+			"trigger_mode control registration failed: %d\n",
+			s_data->ctrl_handler->error);
+		return s_data->ctrl_handler->error ?: -EINVAL;
+	}
+
+	dev_info(&client->dev, "trigger_mode control registered\n");
+	return 0;
+}
+
 static const struct v4l2_subdev_internal_ops imx296_subdev_internal_ops = {
 	.open = imx296_open,
+	.registered = imx296_subdev_registered,
 };
 
 /* ============================================================
@@ -1363,7 +1482,12 @@ static int imx296_probe(struct i2c_client *client,
 		return err;
 	}
 
-	/* Register V4L2 subdevice */
+	/*
+	 * Register V4L2 subdevice. The custom trigger_mode control is added
+	 * by imx296_subdev_registered() (subdev .registered callback), which
+	 * fires inside this call or at VI notifier bind - see the comment
+	 * there for why probe-time registration would be too late.
+	 */
 	err = tegracam_v4l2subdev_register(tc_dev, true);
 	if (err) {
 		dev_err(dev, "tegra camera subdev registration failed\n");
