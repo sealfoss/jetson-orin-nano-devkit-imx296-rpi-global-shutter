@@ -188,4 +188,4 @@ GPL-2.0, see [LICENSE](LICENSE).
 
 <!-- Companion-repo link: update this ONE definition when the
      nvimx296camerasrc repository is published. -->
-[nvimx296camerasrc]: https://github.com/sealfoss/GStreamer-NV-IMX286-Camera-Source
+[nvimx296camerasrc]: https://github.com/sealfoss/GStreamer-NV-IMX296-Camera-Source
